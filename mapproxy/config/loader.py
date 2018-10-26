@@ -973,6 +973,24 @@ class DebugSourceConfiguration(SourceConfiguration):
         from mapproxy.source import DebugSource
         return DebugSource()
 
+class GdalSourceConfiguration(ConfigurationBase):
+    def source(self, params=None):
+        from mapproxy.source.gdal import GdalSource
+
+        if not self.context.seed and self.conf.get('seed_only'):
+            from mapproxy.source import DummySource
+            return DummySource(coverage=self.coverage())
+
+        if params is None: params = {}
+
+        # TODO Include standard configurations
+        coverage = self.coverage()
+        res_range = resolution_range(self.conf)
+
+        # Custom Args
+        file = self.conf['file']
+
+        return GdalSource(file, coverage=coverage, res_range=res_range)
 
 source_configuration_types = {
     'wms': WMSSourceConfiguration,
@@ -981,8 +999,8 @@ source_configuration_types = {
     'debug': DebugSourceConfiguration,
     'mapserver': MapServerSourceConfiguration,
     'mapnik': MapnikSourceConfiguration,
+    'gdal': GdalSourceConfiguration
 }
-
 
 class CacheConfiguration(ConfigurationBase):
     defaults = {'format': 'image/png'}
@@ -2100,5 +2118,3 @@ def parse_color(color):
         return r, g, b, a
 
     return r, g, b
-
-
