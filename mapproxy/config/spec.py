@@ -551,6 +551,11 @@ mapproxy_yaml_spec = {
             }),
             'debug': {
             },
+            'gdal': combined(source_commons, {
+                required('file'): str(),
+                'resampling': str(),
+                'nodata' : int()
+            }),
         })
     },
 

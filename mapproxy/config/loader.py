@@ -533,6 +533,7 @@ class SourceConfiguration(ConfigurationBase):
         source_type = conf['type']
 
         subclass = source_configuration_types.get(source_type)
+
         if not subclass:
             raise ConfigurationError("unknown source type '%s'" % source_type)
 
@@ -973,7 +974,9 @@ class DebugSourceConfiguration(SourceConfiguration):
         from mapproxy.source import DebugSource
         return DebugSource()
 
-class GdalSourceConfiguration(ConfigurationBase):
+class GdalSourceConfiguration(SourceConfiguration):
+    source_type = ('gdal',)
+
     def source(self, params=None):
         from mapproxy.source.gdal import GdalSource
 
@@ -989,8 +992,10 @@ class GdalSourceConfiguration(ConfigurationBase):
 
         # Custom Args
         file = self.conf['file']
+        resampling = self.conf.get('resampling', 'near')
+        srcnodata = self.conf.get('nodata', 0)
 
-        return GdalSource(file, coverage=coverage, res_range=res_range)
+        return GdalSource(file, coverage=coverage, res_range=res_range, resampling=resampling)
 
 source_configuration_types = {
     'wms': WMSSourceConfiguration,
@@ -999,7 +1004,7 @@ source_configuration_types = {
     'debug': DebugSourceConfiguration,
     'mapserver': MapServerSourceConfiguration,
     'mapnik': MapnikSourceConfiguration,
-    'gdal': GdalSourceConfiguration
+    'gdal': GdalSourceConfiguration,
 }
 
 class CacheConfiguration(ConfigurationBase):
