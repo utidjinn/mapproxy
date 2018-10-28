@@ -15,6 +15,7 @@
 
 from mapproxy.layer import MapExtent, DefaultMapExtent, BlankImage, MapLayer
 from mapproxy.util.py import reraise_exception
+from mapproxy.srs import SRS, get_epsg_num
 from osgeo import gdal
 from osgeo import osr
 import os
@@ -47,15 +48,8 @@ class GdalSource(MapLayer):
 
         # Do some initial checks to see if we can use the specified file
         gdal.AllRegister()
-        if self.input_file:
-            input_dataset = gdal.Open(self.input_file, gdal.GA_ReadOnly)
-        else:
-            raise Exception("No input file was specified")
 
-        log.info("Input file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
-                                                           input_dataset.RasterYSize,
-                                                           input_dataset.RasterCount))
-
+        input_dataset = gdal.Open(self.input_file, gdal.GA_ReadOnly)
         if not input_dataset:
             # Note: GDAL prints the ERROR message too
             exit_with_error("It is not possible to open the input file '%s'." % self.input_file)
@@ -73,6 +67,7 @@ class GdalSource(MapLayer):
             )
 
         self.in_srs, self.in_srs_wkt = setup_input_srs(input_dataset)
+        self.epsg = osr.SpatialReference(wkt=self.in_srs_wkt).GetAttrValue('AUTHORITY',1)
 
         # Get alpha band (either directly or from NODATA value)
         self.alphaband = input_dataset.GetRasterBand(1).GetMaskBand()
@@ -92,7 +87,6 @@ class GdalSource(MapLayer):
 
         input_dataset = None
 
-
     def get_map(self, query):
         log.info(query)
         if self.res_range and not self.res_range.contains(query.bbox, query.size,
@@ -107,164 +101,61 @@ class GdalSource(MapLayer):
 
     def render(self, query):
         """Constructor function - initialization"""
-        out_drv = None
-        mem_drv = None
-        out_srs = None
-        tsize = None
-        alphaband = None
-        dataBandsCount = None
-        out_gt = None
-        ominx = None
-        omaxx = None
-        omaxy = None
-        ominy = None
-
         # How big should be query window be for scaling down
         # Later on reset according the chosen resampling algorightm
         querysize = (query.size[0]*4, query.size[1]*4)
-
-        # Tile format
-        tiledriver = 'PNG'
-        tileext = 'png'
-
-        # Should we read bigger window of the input raster and scale it down?
-        # Note: Modified later by open_input()
-        # Not for 'near' resampling
-        # Not for Wavelet based drivers (JPEG2000, ECW, MrSID)
-        # Not for 'raster' profile
-        scaledquery = True
-
         if self.resampling == 'near':
             querysize = (query.size[0], query.size[1])
-
         elif self.resampling == 'bilinear':
             querysize = (query.size[0]*2, query.size[1]*2)
-        out_drv = gdal.GetDriverByName(tiledriver)
-        mem_drv = gdal.GetDriverByName('MEM')
 
-        if not out_drv:
-            raise Exception("The '%s' driver was not found, is it available in this GDAL build?",
-                            tiledriver)
-        if not mem_drv:
-            raise Exception("The 'MEM' driver was not found, is it available in this GDAL build?")
+        bbox = transform_bounding_box(query.bbox, get_epsg_num(query.srs.srs_code), int(self.epsg))
+        log.info(bbox)
 
         # Open the input file
+        ds = gdal.Open(self.input_file, gdal.GA_ReadOnly)
+        in_nodata = setup_no_data_values(ds)
 
-        input_dataset = gdal.Open(self.input_file, gdal.GA_ReadOnly)
+        # Calculate Query
+        (rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize) = geo_query(ds, bbox[0], bbox[3], bbox[2], bbox[1], query.size)
+        log.info("ReadRaster Extent: %s, %s" % ((rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize)))
 
-        in_nodata = setup_no_data_values(input_dataset)
+        data = alpha = None
+        if rxsize != 0 and rysize != 0 and wxsize != 0 and wysize != 0:
+            data = ds.ReadRaster(rx, ry, rxsize, rysize, wxsize, wysize,
+                                 band_list=list(range(1, self.dataBandsCount + 1)))
+            alphaband = ds.GetRasterBand(1).GetMaskBand()
+            alpha = alphaband.ReadRaster(rx, ry, rxsize, rysize, wxsize, wysize)
 
-        log.info("Preprocessed file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
-                                                                  input_dataset.RasterYSize,
-                                                                  input_dataset.RasterCount))
+        if not data:
+            raise BlankImage()
 
-        # TODO out_gt should be based on the SRS of the request
-        # Assume WGS84 for now
-        out_srs = setup_output_srs(self.in_srs, query)
-
-        ds = input_dataset
         tilebands = self.dataBandsCount + 1
-
-        log.info("dataBandsCount: %s", self.dataBandsCount)
-        log.info("tilebands: %s", tilebands)
-
-        (rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize) = geo_query(ds, query.bbox[0], query.bbox[3], query.bbox[2], query.bbox[1], query.size)
-
-        tile_detail = TileDetail(
-            rx=rx, ry=ry, rxsize=rxsize, rysize=rysize, wx=wx,
-            wy=wy, wxsize=wxsize, wysize=wysize, querysize=querysize,
-        )
-
-        conf = TileJobInfo(
-            src_file=self.input_file,
-            nb_data_bands=self.dataBandsCount,
-            tile_extension='png',
-            tile_driver='PNG',
-            tile_size=query.size,
-            in_srs_wkt=self.in_srs_wkt,
-            out_geo_trans=self.out_gt,
-        )
-
-        return render_request(conf, tile_detail, self.resampling, query.size)
-
-
-def render_request(tile_job_info, tile_detail, resampling, size):
-    gdal.AllRegister()
-
-    dataBandsCount = tile_job_info.nb_data_bands
-    tileext = tile_job_info.tile_extension
-    tilesize = tile_job_info.tile_size
-    options = tile_job_info.options
-
-    tilebands = dataBandsCount + 1
-    ds = gdal.Open(tile_job_info.src_file, gdal.GA_ReadOnly)
-    mem_drv = gdal.GetDriverByName('MEM')
-    out_drv = gdal.GetDriverByName(tile_job_info.tile_driver)
-    alphaband = ds.GetRasterBand(1).GetMaskBand()
-
-    rx = tile_detail.rx
-    ry = tile_detail.ry
-    rxsize = tile_detail.rxsize
-    rysize = tile_detail.rysize
-    wx = tile_detail.wx
-    wy = tile_detail.wy
-    wxsize = tile_detail.wxsize
-    wysize = tile_detail.wysize
-    querysize = tile_detail.querysize
-
-    # Tile dataset in memory
-    tilefilename = os.path.join("output.%s" % tileext)
-    dstile = mem_drv.Create('', tilesize[0], tilesize[1], tilebands)
-
-    data = alpha = None
-
-    log.info("\tReadRaster Extent: %s, %s" % ((rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize)))
-
-    # Query is in 'nearest neighbour' but can be bigger in then the tilesize
-    # We scale down the query to the tilesize by supplied algorithm.
-
-    if rxsize != 0 and rysize != 0 and wxsize != 0 and wysize != 0:
-        data = ds.ReadRaster(rx, ry, rxsize, rysize, wxsize, wysize,
-                             band_list=list(range(1, dataBandsCount + 1)))
-        alpha = alphaband.ReadRaster(rx, ry, rxsize, rysize, wxsize, wysize)
-
-    # The tile in memory is a transparent file by default. Write pixel values into it if
-    # any
-    if data:
-        if tilesize == querysize:
-            # Use the ReadRaster result directly in tiles ('nearest neighbour' query)
+        mem_drv = gdal.GetDriverByName('MEM')
+        if not mem_drv:
+            raise Exception("The 'MEM' driver was not found, is it available in this GDAL build?")
+        dstile = mem_drv.Create('', query.size[0], query.size[1], tilebands)
+        if query.size[0] == querysize[0] and query.size[1] == querysize[1]:
             dstile.WriteRaster(wx, wy, wxsize, wysize, data,
-                               band_list=list(range(1, dataBandsCount + 1)))
+                               band_list=list(range(1, self.dataBandsCount + 1)))
             dstile.WriteRaster(wx, wy, wxsize, wysize, alpha, band_list=[tilebands])
-
             # Note: For source drivers based on WaveLet compression (JPEG2000, ECW,
             # MrSID) the ReadRaster function returns high-quality raster (not ugly
             # nearest neighbour)
             # TODO: Use directly 'near' for WaveLet files
         else:
-            # Big ReadRaster query in memory scaled to the tilesize - all but 'near'
-            # algo
+            # User specified a different resampling, so read the larger query size
+            # for use by the resampling algorithm
             dsquery = mem_drv.Create('', querysize[0], querysize[1], tilebands)
+            dsquery.WriteRaster(wx, wy, wxsize, wysize, data,
+                                band_list=list(range(1, self.dataBandsCount + 1)))
+            dsquery.WriteRaster(wx, wy, wxsize, wysize, alpha, band_list=[tilebands])
+            scale_query_to_tile(dsquery, dstile, self.resampling, size)
             # TODO: fill the null value in case a tile without alpha is produced (now
             # only png tiles are supported)
-            dsquery.WriteRaster(wx, wy, wxsize, wysize, data,
-                                band_list=list(range(1, dataBandsCount + 1)))
-            dsquery.WriteRaster(wx, wy, wxsize, wysize, alpha, band_list=[tilebands])
 
-            scale_query_to_tile(dsquery, dstile, tile_job_info.tile_driver, size,
-                                tilefilename=tilefilename)
-            del dsquery
+        return create_img(dstile, query.size, tilebands)
 
-    # Force freeing the memory to make sure the C++ destructor is called and the memory as well as
-    # the file locks are released
-    del ds
-    del data
-
-    if resampling != 'antialias':
-        # Write a copy of tile to png/jpg
-        return create_img(dstile, size, tilebands)
-
-    del dstile
 
 def create_img(ds, size, bands):
     array = numpy.zeros((size[1], size[0], bands), numpy.uint8)
@@ -278,8 +169,6 @@ def geo_query(ds, ulx, uly, lrx, lry, size=None):
     For given dataset and query in cartographic coordinates returns parameters for ReadRaster()
     in raster coordinates and x/y shifts (for border tiles). If the array is not given, the
     extent is returned in the native resolution of dataset ds.
-
-    raises Gdal2TilesError if the dataset does not contain anything inside this geo_query
     """
     log.info("Geo Query Request: %s %s %s %s %s" % (ulx, uly, lrx, lry, size))
     geotran = ds.GetGeoTransform()
@@ -326,7 +215,7 @@ def exit_with_error(message, details=""):
 
     raise BlankImage()
 
-def scale_query_to_tile(dsquery, dstile, tiledriver, resampling, size, tilefilename=''):
+def scale_query_to_tile(dsquery, dstile, resampling, size):
     """Scales down query dataset to the tile dataset"""
     querysize_x = dsquery.RasterXSize
     querysize_y = dsquery.RasterYSize
@@ -343,22 +232,7 @@ def scale_query_to_tile(dsquery, dstile, tiledriver, resampling, size, tilefilen
             res = gdal.RegenerateOverview(dsquery.GetRasterBand(i), dstile.GetRasterBand(i),
                                           'average')
             if res != 0:
-                exit_with_error("RegenerateOverview() failed on %s, error %d" % (
-                    tilefilename, res))
-
-    elif resampling == 'antialias':
-
-        # Scaling by PIL (Python Imaging Library) - improved Lanczos
-        array = numpy.zeros((querysize_x, querysize_y, tilebands), numpy.uint8)
-        for i in range(tilebands):
-            array[:, :, i] = gdalarray.BandReadAsArray(dsquery.GetRasterBand(i + 1),
-                                                       0, 0, querysize_x, querysize_y)
-        im = Image.fromarray(array, 'RGBA')     # Always four bands
-        im1 = im.resize((tilesize_x, tilesize_y), Image.ANTIALIAS)
-        if os.path.exists(tilefilename):
-            im0 = Image.open(tilefilename)
-            im1 = Image.composite(im1, im0, im1)
-        im1.save(tilefilename, tiledriver)
+                exit_with_error("RegenerateOverview() failed, error %d" % res)
 
     else:
 
@@ -378,13 +252,13 @@ def scale_query_to_tile(dsquery, dstile, tiledriver, resampling, size, tilefilen
             gdal_resampling = gdal.GRA_Lanczos
 
         # Other algorithms are implemented by gdal.ReprojectImage().
-        dsquery.SetGeoTransform((0.0, tilesize / float(querysize), 0.0, 0.0, 0.0,
-                                 tilesize / float(querysize)))
+        dsquery.SetGeoTransform((0.0, tilesize_x / float(querysize_x), 0.0, 0.0, 0.0,
+                                 tilesize_x / float(tilesize_y)))
         dstile.SetGeoTransform((0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
 
         res = gdal.ReprojectImage(dsquery, dstile, None, None, gdal_resampling)
         if res != 0:
-            exit_with_error("ReprojectImage() failed on %s, error %d" % (tilefilename, res))
+            exit_with_error("ReprojectImage() failed, error %d" % res)
 
 
 def setup_no_data_values(input_dataset):
@@ -447,3 +321,64 @@ def nb_data_bands(dataset):
         return dataset.RasterCount - 1
     else:
         return dataset.RasterCount
+
+def transform_bounding_box(
+        bounding_box, base_epsg, new_epsg, edge_samples=11):
+    """Transform input bounding box to output projection.
+
+    This transform accounts for the fact that the reprojected square bounding
+    box might be warped in the new coordinate system.  To account for this,
+    the function samples points along the original bounding box edges and
+    attempts to make the largest bounding box around any transformed point
+    on the edge whether corners or warped edges.
+
+    Parameters:
+        bounding_box (list): a list of 4 coordinates in `base_epsg` coordinate
+            system describing the bound in the order [xmin, ymin, xmax, ymax]
+        base_epsg (int): the EPSG code of the input coordinate system
+        new_epsg (int): the EPSG code of the desired output coordinate system
+        edge_samples (int): the number of interpolated points along each
+            bounding box edge to sample along. A value of 2 will sample just
+            the corners while a value of 3 will also sample the corners and
+            the midpoint.
+
+    Returns:
+        A list of the form [xmin, ymin, xmax, ymax] that describes the largest
+        fitting bounding box around the original warped bounding box in
+        `new_epsg` coordinate system.
+    """
+    base_ref = osr.SpatialReference()
+    base_ref.ImportFromEPSG(base_epsg)
+
+    new_ref = osr.SpatialReference()
+    new_ref.ImportFromEPSG(new_epsg)
+
+    transformer = osr.CoordinateTransformation(base_ref, new_ref)
+
+    p_0 = numpy.array((bounding_box[0], bounding_box[3]))
+    p_1 = numpy.array((bounding_box[0], bounding_box[1]))
+    p_2 = numpy.array((bounding_box[2], bounding_box[1]))
+    p_3 = numpy.array((bounding_box[2], bounding_box[3]))
+
+    def _transform_point(point):
+        trans_x, trans_y, _ = (transformer.TransformPoint(*point))
+        return (trans_x, trans_y)
+
+    # This list comprehension iterates over each edge of the bounding box,
+    # divides each edge into `edge_samples` number of points, then reduces
+    # that list to an appropriate `bounding_fn` given the edge.
+    # For example the left edge needs to be the minimum x coordinate so
+    # we generate `edge_samples` number of points between the upper left and
+    # lower left point, transform them all to the new coordinate system
+    # then get the minimum x coordinate "min(p[0] ...)" of the batch.
+    transformed_bounding_box = [
+        bounding_fn(
+            [_transform_point(
+                p_a * v + p_b * (1 - v)) for v in numpy.linspace(
+                    0, 1, edge_samples)])
+        for p_a, p_b, bounding_fn in [
+            (p_0, p_1, lambda p_list: min([p[0] for p in p_list])),
+            (p_1, p_2, lambda p_list: min([p[1] for p in p_list])),
+            (p_2, p_3, lambda p_list: max([p[0] for p in p_list])),
+            (p_3, p_0, lambda p_list: max([p[1] for p in p_list]))]]
+    return transformed_bounding_box
