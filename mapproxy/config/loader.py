@@ -980,6 +980,8 @@ class GdalSourceConfiguration(SourceConfiguration):
     def source(self, params=None):
         from mapproxy.source.gdal import GdalSource
 
+        image_opts = self.image_opts()
+
         if not self.context.seed and self.conf.get('seed_only'):
             from mapproxy.source import DummySource
             return DummySource(coverage=self.coverage())
@@ -995,7 +997,7 @@ class GdalSourceConfiguration(SourceConfiguration):
         resampling = self.conf.get('resampling', 'near')
         srcnodata = self.conf.get('nodata', 0)
 
-        return GdalSource(file, coverage=coverage, res_range=res_range, resampling=resampling)
+        return GdalSource(file, image_opts=image_opts, coverage=coverage, res_range=res_range, resampling=resampling)
 
 source_configuration_types = {
     'wms': WMSSourceConfiguration,

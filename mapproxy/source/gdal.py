@@ -23,6 +23,10 @@ from mapproxy.image import ImageSource
 from mapproxy.image.opts import ImageOptions
 from mapproxy.compat import BytesIO
 
+from PIL import Image
+import numpy
+import osgeo.gdal_array as gdalarray
+
 import logging
 log = logging.getLogger('mapproxy.source.gdal')
 
@@ -30,7 +34,8 @@ log = logging.getLogger('mapproxy.source.gdal')
 Retrieve maps/information from GDAL Sources.
 """
 class GdalSource(MapLayer):
-    def __init__(self, file, coverage=None, res_range=None, resampling='near'):
+    def __init__(self, file, image_opts=None, coverage=None, res_range=None, resampling='near'):
+        MapLayer.__init__(self, image_opts=image_opts)
         self.input_file = file
         self.coverage = coverage
         self.res_range = res_range
@@ -40,13 +45,14 @@ class GdalSource(MapLayer):
             self.extent = DefaultMapExtent()
         self.resampling = resampling
 
+        # Do some initial checks to see if we can use the specified file
         gdal.AllRegister()
         if self.input_file:
             input_dataset = gdal.Open(self.input_file, gdal.GA_ReadOnly)
         else:
             raise Exception("No input file was specified")
 
-        log.debug("Input file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
+        log.info("Input file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
                                                            input_dataset.RasterYSize,
                                                            input_dataset.RasterCount))
 
@@ -96,9 +102,8 @@ class GdalSource(MapLayer):
             raise BlankImage()
 
         data = self.render(query)
-        log.info(data)
 
-        return ImageSource(BytesIO(data), size=query.size)
+        return ImageSource(data, size=query.size)
 
     def render(self, query):
         """Constructor function - initialization"""
@@ -149,7 +154,7 @@ class GdalSource(MapLayer):
 
         in_nodata = setup_no_data_values(input_dataset)
 
-        log.debug("Preprocessed file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
+        log.info("Preprocessed file: ( %sP x %sL - %s bands)" % (input_dataset.RasterXSize,
                                                                   input_dataset.RasterYSize,
                                                                   input_dataset.RasterCount))
 
@@ -160,10 +165,10 @@ class GdalSource(MapLayer):
         ds = input_dataset
         tilebands = self.dataBandsCount + 1
 
-        log.debug("dataBandsCount: ", self.dataBandsCount)
-        log.debug("tilebands: ", tilebands)
+        log.info("dataBandsCount: %s", self.dataBandsCount)
+        log.info("tilebands: %s", tilebands)
 
-        (rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize) = geo_query(ds, query.bbox[1], query.bbox[2], query.bbox[3], query.bbox[0], query.size)
+        (rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize) = geo_query(ds, query.bbox[0], query.bbox[3], query.bbox[2], query.bbox[1], query.size)
 
         tile_detail = TileDetail(
             rx=rx, ry=ry, rxsize=rxsize, rysize=rysize, wx=wx,
@@ -213,7 +218,7 @@ def render_request(tile_job_info, tile_detail, resampling, size):
 
     data = alpha = None
 
-    log.debug("\tReadRaster Extent: %s, %s" % ((rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize)))
+    log.info("\tReadRaster Extent: %s, %s" % ((rx, ry, rxsize, rysize), (wx, wy, wxsize, wysize)))
 
     # Query is in 'nearest neighbour' but can be bigger in then the tilesize
     # We scale down the query to the tilesize by supplied algorithm.
@@ -257,10 +262,16 @@ def render_request(tile_job_info, tile_detail, resampling, size):
 
     if resampling != 'antialias':
         # Write a copy of tile to png/jpg
-        out_drv.CreateCopy(tilefilename, dstile, strict=0)
+        return create_img(dstile, size, tilebands)
 
     del dstile
 
+def create_img(ds, size, bands):
+    array = numpy.zeros((size[1], size[0], bands), numpy.uint8)
+    for i in range(bands):
+        array[:, :, i] = gdalarray.BandReadAsArray(ds.GetRasterBand(i + 1),
+                                                   0, 0, size[0], size[1])
+    return Image.fromarray(array, 'RGBA')    # Always four bands
 
 def geo_query(ds, ulx, uly, lrx, lry, size=None):
     """
@@ -270,7 +281,9 @@ def geo_query(ds, ulx, uly, lrx, lry, size=None):
 
     raises Gdal2TilesError if the dataset does not contain anything inside this geo_query
     """
+    log.info("Geo Query Request: %s %s %s %s %s" % (ulx, uly, lrx, lry, size))
     geotran = ds.GetGeoTransform()
+    log.info(geotran)
     rx = int((ulx - geotran[0]) / geotran[1] + 0.001)
     ry = int((uly - geotran[3]) / geotran[5] + 0.001)
     rxsize = int((lrx - ulx) / geotran[1] + 0.5)
@@ -384,7 +397,7 @@ def setup_no_data_values(input_dataset):
         if raster_no_data is not None:
             in_nodata.append(raster_no_data)
 
-    log.debug("NODATA: %s" % in_nodata)
+    log.info("NODATA: %s" % in_nodata)
 
     return in_nodata
 
