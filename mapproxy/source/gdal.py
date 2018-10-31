@@ -150,7 +150,7 @@ class GdalSource(MapLayer):
             dsquery.WriteRaster(wx, wy, wxsize, wysize, data,
                                 band_list=list(range(1, self.dataBandsCount + 1)))
             dsquery.WriteRaster(wx, wy, wxsize, wysize, alpha, band_list=[tilebands])
-            scale_query_to_tile(dsquery, dstile, self.resampling, size)
+            scale_query_to_tile(dsquery, dstile, self.resampling, query.size)
             # TODO: fill the null value in case a tile without alpha is produced (now
             # only png tiles are supported)
 
@@ -173,8 +173,8 @@ def geo_query(ds, ulx, uly, lrx, lry, size=None):
     log.info("Geo Query Request: %s %s %s %s %s" % (ulx, uly, lrx, lry, size))
     geotran = ds.GetGeoTransform()
     log.info(geotran)
-    rx = int((ulx - geotran[0]) / geotran[1] + 0.001)
-    ry = int((uly - geotran[3]) / geotran[5] + 0.001)
+    rx = int((ulx - geotran[0]) / geotran[1])
+    ry = int((uly - geotran[3]) / geotran[5])
     rxsize = int((lrx - ulx) / geotran[1] + 0.5)
     rysize = int((lry - uly) / geotran[5] + 0.5)
 
